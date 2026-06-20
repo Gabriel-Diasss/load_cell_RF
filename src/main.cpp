@@ -1,295 +1,254 @@
 // =============================================================================
-// load_cell_RF - Leitura de Célula de Carga com Transmissão ESP-NOW
+// load_cell_RF - Leitura de Sensores com Transmissão ESP-NOW
 // =============================================================================
-// Este firmware roda em um ESP32 e faz três coisas:
-//   1. Lê o peso de uma célula de carga usando o ADC HX711.
-//   2. Aplica um filtro de média móvel para suavizar o sinal.
-//   3. Envia os dados (massa filtrada e bruta) via ESP-NOW para outro ESP32.
+// Este firmware roda em um ESP32 e faz:
+//   1. Lê duas células de carga (HX711 #1 e #2).
+//   2. Lê dois termopares tipo K (MAX6675 #1 e #2).
+//   3. Aplica filtro de média móvel nas células de carga.
+//   4. Envia todos os dados via ESP-NOW a cada 100ms (10 Hz).
+//
+// O loop usa millis() para controle de tempo, sem delay(), permitindo
+// que o polling dos HX711 seja feito de forma não-bloqueante.
 // =============================================================================
 
 // =============================================================================
 // BIBLIOTECAS
 // =============================================================================
-
-// Arduino.h é o núcleo do Arduino Framework. Fornece tipos como uint8_t,
-// float, bool, e funções como delay(), millis(), Serial.print(), etc.
 #include <Arduino.h>
-
-// ESP-NOW é um protocolo de comunicação sem fio da Espressif (fabricante do
-// ESP32). Diferente do WiFi comum, ele não precisa de roteador: os ESP32s
-// se comunicam diretamente, par-a-par (peer-to-peer), de forma rápida e
-// com baixo consumo de energia. Ideal para sensores.
 #include <esp_now.h>
-
-// WiFi.h permite configurar o rádio WiFi do ESP32. O ESP-NOW exige que o
-// WiFi esteja ativo, mesmo que não estejamos conectados a uma rede.
 #include <WiFi.h>
-
-// HX711.h é a biblioteca para o conversor analógico-digital HX711 de 24 bits,
-// usado especificamente para ler células de carga (strain gauges).
 #include "HX711.h"
-
-// MovingAverageFilter.h é a nossa própria classe de filtro de média móvel,
-// definida nos arquivos include/MovingAverageFilter.h e
-// src/MovingAverageFilter.cpp.
+#include <max6675.h>
 #include "MovingAverageFilter.h"
 
-// Wire.h e LiquidCrystal_I2C.h estão comentados porque o display LCD
-// físico ainda não está disponível. Quando chegar, basta descomentar.
-// Wire.h:   biblioteca padrão do Arduino para comunicação I2C.
-// LiquidCrystal_I2C.h: driver para displays LCD com backpack I2C (PCF8574).
-//#include <Wire.h>
-//#include <LiquidCrystal_I2C.h>
-
 // =============================================================================
-// CONFIGURAÇÃO DA CÉLULA DE CARGA / HX711
+// CONFIGURAÇÃO DOS SENSORES
 // =============================================================================
 
-// Fator de calibração: converte a leitura bruta do ADC (units) para
-// força em Newtons (N). Este valor foi obtido experimentalmente usando
-// um peso conhecido e ajustando até a leitura ficar correta.
-// Quanto maior o fator, menor o valor lido (mais "rígida" a escala).
-#define CALIBRATION_FACTOR 45300
+// --- Células de Carga (HX711) ---
 
-// Pinos GPIO do ESP32 conectados ao HX711:
-// DOUT (Data Out) -> pino digital onde o HX711 sinaliza que há dado pronto
-// SCK  (Serial Clock) -> pino onde enviamos pulsos para ler os bits
-#define LOADCELL_DOUT_PIN  21
-#define LOADCELL_SCK_PIN  22
+// Fator de calibração: converte leitura bruta do ADC para Newtons.
+// Obtido experimentalmente com peso conhecido.
+// Cada célula pode ter seu próprio fator (calibre individualmente).
+#define CAL_FACTOR_1  45300
+#define CAL_FACTOR_2  45300
 
-// A célula de carga medeFORÇA (Newtons), mas queremos MASSA (gramas).
-// A relação é: Peso(N) = massa(kg) * gravidade(m/s²)
-//                massa(g) = (Peso(N) * 1000) / 9.807
-// NEWTON_TO_GRAM é a constante pré-calculada: 1000 / 9.807 ≈ 101.97
-// Assim, basta multiplicar o valor em Newtons por esta constante.
-constexpr float GRAVITY = 9.807f;          // Aceleração da gravidade (m/s²)
-constexpr float NEWTON_TO_GRAM = 1000.0f / GRAVITY;  // Fator de conversão N -> g
+// Pinos GPIO do HX711 #1
+#define HX1_DOUT  21
+#define HX1_SCK   22
 
-// Cria o objeto 'scale' da classe HX711 para controlar o ADC.
-HX711 scale;
+// Pinos GPIO do HX711 #2
+#define HX2_DOUT  25
+#define HX2_SCK   26
 
-// Cria o filtro de média móvel com 5 amostras.
-// A cada leitura, a média é calculada sobre as 5 leituras mais recentes.
-// Isso suaviza variações bruscas causadas por vibração ou ruído elétrico.
-MovingAverageFilter filter(5);
+// --- Termopares (MAX6675) ---
+// Os dois MAX6675 compartilham SCK e SO (mesmo barramento SPI),
+// cada um com seu próprio pino CS.
+#define MAX1_CS   5
+#define MAX2_CS   22
+#define MAX_SCK   18
+#define MAX_SO    19
 
-// Objeto do LCD (comentado até o display chegar).
-// Endereço I2C 0x27, display 20 colunas por 4 linhas.
-// Parâmetros: (endereço I2C, colunas, linhas)
-//LiquidCrystal_I2C lcd(0x27, 20, 4);
+// =============================================================================
+// CONSTANTES FÍSICAS
+// =============================================================================
+// A célula de carga mede força (Newtons). Para obter massa (gramas):
+//   massa(g) = força(N) × 1000 / 9.807
+constexpr float GRAVITY = 9.807f;
+constexpr float N_TO_G  = 1000.0f / GRAVITY;
+
+// =============================================================================
+// CONTROLE DE TEMPO
+// =============================================================================
+const unsigned long SEND_INTERVAL_MS  = 100;   // 10 Hz
+const unsigned long MAX_INTERVAL_MS   = 250;   // MAX6675: ~4 Hz
+
+// =============================================================================
+// OBJETOS GLOBAIS
+// =============================================================================
+
+// --- HX711 ---
+HX711 scale_1;
+HX711 scale_2;
+
+// --- MAX6675 ---
+// Construtor: MAX6675(pino_SCK, pino_CS, pino_SO)
+MAX6675 thermo_1(MAX_SCK, MAX1_CS, MAX_SO);
+MAX6675 thermo_2(MAX_SCK, MAX2_CS, MAX_SO);
+
+// --- Filtros de média móvel (5 amostras cada) ---
+MovingAverageFilter filter_1(5);
+MovingAverageFilter filter_2(5);
 
 // =============================================================================
 // CONFIGURAÇÃO ESP-NOW
 // =============================================================================
 
-// Endereço MAC do ESP32 que vai RECEBER os dados.
-// O valor vem da build_flag definida no platformio.ini:
-//   -D RECEIVER_MAC={0x80,0xF3,0xDA,0x5D,0x35,0x64}
-// Se a flag não for passada, usa o valor padrão abaixo (fallback).
+// MAC do receptor, definido via build_flag no platformio.ini
 #ifndef RECEIVER_MAC
 #define RECEIVER_MAC {0x80, 0xF3, 0xDA, 0x5D, 0x35, 0x64}
 #endif
-
-// Converte a macro em um array de 6 bytes que o ESP-NOW entende.
 uint8_t broadcastAddress[] = RECEIVER_MAC;
 
-// Estrutura da mensagem que será enviada via rádio.
-// Cada pacote ESP-NOW pode ter no MÁXIMO 250 bytes.
-// Aqui temos: 32 + 4 + 32 + 4 = 72 bytes (bem dentro do limite).
+// Estrutura dos dados enviados via rádio (16 bytes)
 typedef struct struct_message {
-    char labelA[32];       // String com o rótulo do primeiro valor
-    float filteredMass;    // Massa filtrada em gramas (float = 4 bytes)
-    char labelC[32];       // String com o rótulo do segundo valor
-    float rawMass;         // Massa bruta (sem filtro) em gramas
+    float load_cell_1_g;     // Massa filtrada, célula 1 [gramas]
+    float load_cell_2_g;     // Massa filtrada, célula 2 [gramas]
+    float thermocouple_1_c;  // Temperatura termopar 1 [°C]
+    float thermocouple_2_c;  // Temperatura termopar 2 [°C]
 } struct_message;
 
-// Instância da estrutura que será preenchida e enviada a cada ciclo.
 struct_message myData;
-
-// Informações do peer (receptor) necessárias para o ESP-NOW.
 esp_now_peer_info_t peerInfo;
-
-// Flag volátil que indica se o último envio foi bem-sucedido.
-// 'volatile' é necessário porque esta variável é modificada dentro de
-// um callback (contexto de interrupção/FreeRTOS). Sem 'volatile', o
-// compilador pode otimizar as leituras e nunca ver o novo valor.
 volatile bool lastSendSuccess = false;
 
 // =============================================================================
-// CALLBACK DE ENVIO ESP-NOW
+// TIMERS (millis)
 // =============================================================================
-// Esta função é chamada automaticamente pelo ESP-NOW quando um pacote
-// termina de ser transmitido (com sucesso ou falha).
-// ATENÇÃO: ela roda em um contexto especial (callback do ESP-NOW), então
-// NÃO deve conter operações lentas ou chamadas como Serial.print().
-// Por isso apenas atualizamos a flag lastSendSuccess.
+unsigned long lastSendMs = 0;
+unsigned long lastMaxMs  = 0;
+
+// =============================================================================
+// CALLBACK ESP-NOW
+// =============================================================================
+// Chamada ao finalizar cada transmissão. Roda em contexto de callback
+// (não usar Serial.print aqui).
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-    // status pode ser: ESP_NOW_SEND_SUCCESS ou ESP_NOW_SEND_FAIL
     lastSendSuccess = (status == ESP_NOW_SEND_SUCCESS);
 }
 
 // =============================================================================
-// FUNÇÃO setup() - Roda UMA VEZ ao ligar ou resetar o ESP32
+// UTILITÁRIOS
+// =============================================================================
+float convertToGrams(float units) {
+    return units * N_TO_G;
+}
+
+// =============================================================================
+// SETUP
 // =============================================================================
 void setup() {
-    // Inicializa a comunicação serial com o computador a 115200 baud.
-    // Permite ver mensagens de debug no Monitor Serial da PlatformIO.
     Serial.begin(115200);
 
-    // ---- Inicialização do WiFi + ESP-NOW ----
-
-    // Configura o rádio WiFi no modo Station (cliente).
-    // O ESP-NOW exige que o WiFi esteja em modo Station (WIFI_STA) ou
-    // modo SoftAP + Station (WIFI_AP_STA). Não funciona com WiFi desligado.
+    // --- Wi-Fi + ESP-NOW ---
     WiFi.mode(WIFI_STA);
 
-    // Inicializa o protocolo ESP-NOW.
-    // Retorna ESP_OK se deu certo, ESP_ERR_INVALID_STATE se o WiFi não está
-    // no modo correto, etc.
     if (esp_now_init() != ESP_OK) {
         Serial.println("Error initializing ESP-NOW");
-        return;  // Se falhou, para o setup aqui (não adianta continuar)
+        return;
     }
-
-    // Registra a função OnDataSent como callback de envio.
-    // Sempre que um pacote for enviado, o ESP-NOW chamará esta função.
     esp_now_register_send_cb(OnDataSent);
 
-    // Preenche a estrutura peerInfo com os dados do receptor:
-    memcpy(peerInfo.peer_addr, broadcastAddress, 6);  // MAC de 6 bytes
-    peerInfo.channel = 0;    // Canal 0 = usa o mesmo canal do WiFi (qualquer)
-    peerInfo.encrypt = false;  // Sem criptografia (mais simples e rápido)
+    memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+    peerInfo.channel = 0;
+    peerInfo.encrypt = false;
+    peerInfo.ifidx   = WIFI_IF_STA;
 
-    // Adiciona o receptor à lista de peers do ESP-NOW.
-    // O ESP-NOW precisa conhecer o peer antes de enviar dados para ele.
     if (esp_now_add_peer(&peerInfo) != ESP_OK) {
         Serial.println("Failed to add peer");
         return;
     }
 
-    // ---- Inicialização do HX711 (célula de carga) ----
-
-    // Informa quais pinos GPIO estão conectados ao DOUT e SCK do HX711.
-    scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
-
-    // Aplica o fator de calibração. As leituras de scale.get_units() serão
-    // (valor_bruto - offset) / calibration_factor, resultando em Newtons.
-    scale.set_scale(CALIBRATION_FACTOR);
-
-    // Tare (tara): faz uma leitura com a balança vazia e guarda esse valor
-    // como offset (zero). Todas as leituras futuras serão relativas a este zero.
-    scale.tare();
-
-    // Aguarda o HX711 ficar pronto. O parâmetros são:
-    //   - 10: número de tentativas
-    //   - 500: tempo de espera entre tentativas (em microssegundos? ms?)
-    // Retorna false se esgotar as tentativas sem resposta.
-    if (!scale.wait_ready_retry(10, 500)) {
-        Serial.println("HX711 not found");
-        // Não damos return aqui porque o HX711 pode demorar mais para
-        // responder, e tentaremos ler novamente no loop().
+    // --- HX711 #1 ---
+    scale_1.begin(HX1_DOUT, HX1_SCK);
+    scale_1.set_scale(CAL_FACTOR_1);
+    scale_1.tare();
+    if (!scale_1.wait_ready_retry(10, 500)) {
+        Serial.println("HX711 #1 not found");
     }
 
-    // ---- Inicialização do LCD (comentado - display ainda não disponível) ----
-    // lcd.init();         // Inicializa a comunicação I2C com o display
-    // lcd.backlight();    // Liga a luz de fundo (backlight)
-    // lcd.clear();        // Limpa o display
+    // --- HX711 #2 ---
+    scale_2.begin(HX2_DOUT, HX2_SCK);
+    scale_2.set_scale(CAL_FACTOR_2);
+    scale_2.tare();
+    if (!scale_2.wait_ready_retry(10, 500)) {
+        Serial.println("HX711 #2 not found");
+    }
 
-    Serial.println("HX711 scale demo");
-    Serial.println("Readings:");
+    // --- MAX6675 ---
+    // Inicializados no construtor global.
+
+    Serial.println("\n=== load_cell_RF ===");
+    Serial.print("MAC: ");
+    Serial.println(WiFi.macAddress());
+    Serial.print("Destino: ");
+    for (int i = 0; i < 6; i++) {
+        Serial.printf("%02X%c", broadcastAddress[i], i < 5 ? ':' : '\n');
+    }
+    Serial.println("Setup OK. Aguardando sensores...\n");
 }
 
 // =============================================================================
-// FUNÇÃO AUXILIAR: converte Newtons para gramas
+// LOOP
 // =============================================================================
-// A HX711.get_units() retorna a força em Newtons (após calibração e tara).
-// Multiplicamos por NEWTON_TO_GRAM (≈101.97) para obter a massa em gramas.
-float convertToGrams(float units) {
-    return units * NEWTON_TO_GRAM;
-}
-
-// =============================================================================
-// FUNÇÃO loop() - Roda REPETIDAMENTE enquanto o ESP32 estiver ligado
+// O loop executa continuamente sem delay():
+//   - HX711s: polling não-bloqueante via is_ready()
+//   - MAX6675s: leitura a cada ~250ms (timer)
+//   - Envio ESP-NOW: a cada 100ms (timer via millis())
 // =============================================================================
 void loop() {
-    // Antes de ler, verifica se o HX711 tem um novo dado disponível.
-    // is_ready() retorna true quando o pino DOUT vai para LOW,
-    // indicando que a conversão terminou e o dado pode ser lido.
-    if (!scale.is_ready()) {
-        // Se não estiver pronto, espera 100ms e tenta de novo no próximo ciclo.
-        // Isso evita ler dados corrompidos ou incompletos.
-        Serial.println("HX711 not ready");
-        delay(100);
-        return;  // Sai do loop() sem fazer nada, volta no próximo ciclo
+    unsigned long now = millis();
+
+    // ========================================================================
+    // 1. POLLING HX711 #1 (não-bloqueante)
+    // ========================================================================
+    // Quando is_ready() retorna true, o HX711 completou uma conversão.
+    // Lemos o valor e passamos pelo filtro de média móvel.
+    if (scale_1.is_ready()) {
+        float rawUnits = scale_1.get_units(1);
+        float filteredUnits = filter_1.addReading(rawUnits);
+        myData.load_cell_1_g = convertToGrams(filteredUnits);
     }
 
-    // Lê o valor do HX711 UMA ÚNICA VEZ.
-    // get_units() retorna a força em Newtons: (leitura_bruta - offset) / escala.
-    // Importante: lemos uma vez só e usamos este mesmo valor para calcular
-    // tanto a massa bruta quanto a filtrada. No código original, o filtro
-    // lia o sensor internamente, resultando em duas leituras em instantes
-    // diferentes (leituras inconsistentes).
-    float rawUnits = scale.get_units();
-
-    // Converte o valor bruto (Newtons) para massa (gramas).
-    float rawMass = convertToGrams(rawUnits);
-
-    // Passa o mesmo valor pelo filtro de média móvel e converte para gramas.
-    // filter.addReading() armazena a nova amostra e retorna a média das
-    // últimas 5 leituras. Aplicamos convertToGrams() no resultado médio.
-    float filteredMass = convertToGrams(filter.addReading(rawUnits));
-
-    // ---- Impressão no Monitor Serial ----
-    // Mostra ambos os valores para comparação: o filtrado é mais suave,
-    // o bruto reage mais rápido mas tem mais ruído.
-    Serial.print("Filtered Mass: ");
-    Serial.print(filteredMass, 3);  // 3 casas decimais (ex: 125.437g)
-    Serial.print("g || Raw Mass: ");
-    Serial.print(rawMass, 3);
-    Serial.println("g");
-
-    // ---- Atualização do Display LCD (comentado - futuro) ----
-    // lcd.clear();
-    // lcd.setCursor(0, 0);      // Coluna 0, Linha 0 (primeira linha)
-    // lcd.print("Bancada de teste");
-    // lcd.setCursor(1, 1);      // Coluna 1, Linha 1 (segunda linha)
-    // lcd.print("Mass: ");
-    // lcd.print(filteredMass, 3);
-    // lcd.print("g");
-
-    // ---- Preparação e Envio do Pacote ESP-NOW ----
-    // Preenche a estrutura com os dados a serem enviados.
-    // strcpy copia a string literal para o array de char.
-    strcpy(myData.labelA, "Filtered Mass:");
-    myData.filteredMass = filteredMass;
-    strcpy(myData.labelC, "Raw Mass:");
-    myData.rawMass = rawMass;
-
-    // Envia o pacote via ESP-NOW.
-    // Parâmetros:
-    //   - broadcastAddress: MAC do destinatário
-    //   - (uint8_t *)&myData: ponteiro para a estrutura convertida para bytes
-    //   - sizeof(myData): tamanho do pacote em bytes
-    // Retorna:
-    //   - ESP_OK: pacote enfileirado para envio (NÃO significa que chegou)
-    //   - ESP_FAIL: erro ao enfileirar
-    esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *)&myData, sizeof(myData));
-
-    // Verifica se o pacote foi enfileirado corretamente.
-    // O resultado da transmissão em si é informado via callback OnDataSent,
-    // que preenche a flag lastSendSuccess.
-    if (result == ESP_OK) {
-        Serial.print("Send: ");
-        Serial.println(lastSendSuccess ? "OK" : "FAIL");
-    } else {
-        Serial.println("Send error");
+    // ========================================================================
+    // 2. POLLING HX711 #2 (não-bloqueante)
+    // ========================================================================
+    if (scale_2.is_ready()) {
+        float rawUnits = scale_2.get_units(1);
+        float filteredUnits = filter_2.addReading(rawUnits);
+        myData.load_cell_2_g = convertToGrams(filteredUnits);
     }
 
-    // Aguarda 100ms antes do próximo ciclo.
-    // Isso define a taxa de amostragem em ~10 leituras por segundo.
-    // O delay é importante para:
-    //   1. Dar tempo do HX711 fazer a próxima conversão.
-    //   2. Não sobrecarregar o rádio ESP-NOW.
-    //   3. Manter uma taxa estável e legível no Serial Monitor.
-    delay(100);
+    // ========================================================================
+    // 3. LEITURA DOS MAX6675 (timer ~250ms)
+    // ========================================================================
+    // MAX6675 é mais lento (~4 Hz), então lemos em intervalo separado.
+    // readCelsius() retorna NaN se o termopar estiver desconectado.
+    if (now - lastMaxMs >= MAX_INTERVAL_MS) {
+        float t = thermo_1.readCelsius();
+        if (!isnan(t)) myData.thermocouple_1_c = t;
+
+        t = thermo_2.readCelsius();
+        if (!isnan(t)) myData.thermocouple_2_c = t;
+
+        lastMaxMs = now;
+    }
+
+    // ========================================================================
+    // 4. ENVIO VIA ESP-NOW (timer 100ms)
+    // ========================================================================
+    if (now - lastSendMs >= SEND_INTERVAL_MS) {
+        esp_err_t result = esp_now_send(
+            broadcastAddress,
+            (uint8_t *)&myData,
+            sizeof(myData)
+        );
+
+        if (result == ESP_OK) {
+            Serial.printf(
+                "LC1:%7.1fg  LC2:%7.1fg  "
+                "TC1:%5.1fC  TC2:%5.1fC  "
+                "Send:%s\n",
+                myData.load_cell_1_g,
+                myData.load_cell_2_g,
+                myData.thermocouple_1_c,
+                myData.thermocouple_2_c,
+                lastSendSuccess ? "OK" : "FAIL"
+            );
+        } else {
+            Serial.println("Send error");
+        }
+
+        lastSendMs = now;
+    }
 }
