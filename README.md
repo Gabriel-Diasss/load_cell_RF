@@ -98,7 +98,7 @@ Sistema de aquisição de dados com ESP32 utilizando **2 células de carga** (HX
 
 | MAX6675 #2 | ESP32 |
 |---|---|
-| CS | GPIO22 |
+| CS | GPIO23 |
 | SCK | GPIO18 *(compartilhado)* |
 | SO | GPIO19 *(compartilhado)* |
 | VCC | 3.3V |
@@ -123,7 +123,7 @@ GPIO18 ───┤ SCK          │
 GPIO19 ───┤ SO           │
           └──────────────┘
           ┌──────────────┐
-GPIO22 ───┤ CS  MAX6675#2├── Termopar 2
+GPIO23 ───┤ CS  MAX6675#2├── Termopar 2
 GPIO18 ───┤ SCK          │
 GPIO19 ───┤ SO           │
           └──────────────┘
@@ -222,19 +222,21 @@ O MAC aparecerá como `80:F3:DA:5D:35:64`. Atualize o `platformio.ini` com este 
 
 ## Estrutura dos Dados ESP-NOW
 
-A struct enviada tem exatamente **16 bytes**:
+A struct enviada tem exatamente **20 bytes**:
 
 ```cpp
 typedef struct struct_message {
-    float load_cell_1_g;     // offset 0,  4 bytes
-    float load_cell_2_g;     // offset 4,  4 bytes
-    float thermocouple_1_c;  // offset 8,  4 bytes
-    float thermocouple_2_c;  // offset 12, 4 bytes
+    float timestamp_s;       // offset 0,  4 bytes
+    float load_cell_1_g;     // offset 4,  4 bytes
+    float load_cell_2_g;     // offset 8,  4 bytes
+    float thermocouple_1_c;  // offset 12, 4 bytes
+    float thermocouple_2_c;  // offset 16, 4 bytes
 } struct_message;
 ```
 
 | Campo | Tipo | Unidade | Descrição |
 |---|---|---|---|
+| `timestamp_s` | float | segundos | Timestamp da coleta (millis()/1000) |
 | `load_cell_1_g` | float | gramas | Massa filtrada (média móvel 5) da célula 1 |
 | `load_cell_2_g` | float | gramas | Massa filtrada (média móvel 5) da célula 2 |
 | `thermocouple_1_c` | float | °C | Temperatura do termopar 1 |
@@ -278,12 +280,13 @@ MAC: 3C:61:05:12:34:56
 Destino: 80:F3:DA:5D:35:64
 Setup OK. Aguardando sensores...
 
-LC1:    0.0g  LC2:    0.0g  TC1: 25.4C  TC2: 26.1C  Send:OK
-LC1:  125.3g  LC2:    0.2g  TC1: 25.4C  TC2: 26.1C  Send:OK
-LC1:  124.8g  LC2:   10.5g  TC1: 25.5C  TC2: 26.1C  Send:OK
-LC1:  125.1g  LC2:   10.2g  TC1: 25.5C  TC2: 26.2C  Send:OK
+0.000s  LC1:    0.0g  LC2:    0.0g  TC1: 25.4C  TC2: 26.1C  Send:OK
+0.101s  LC1:  125.3g  LC2:    0.2g  TC1: 25.4C  TC2: 26.1C  Send:OK
+0.201s  LC1:  124.8g  LC2:   10.5g  TC1: 25.5C  TC2: 26.1C  Send:OK
+0.302s  LC1:  125.1g  LC2:   10.2g  TC1: 25.5C  TC2: 26.2C  Send:OK
 ```
 
+- `timestamp`: segundos desde o boot (3 casas decimais)
 - `LC1/LC2`: massa filtrada em gramas (7 caracteres, 1 casa decimal)
 - `TC1/TC2`: temperatura em °C (5 caracteres, 1 casa decimal)
 - `Send:OK/FAIL`: status da última transmissão

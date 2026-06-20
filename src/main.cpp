@@ -45,7 +45,7 @@
 // Os dois MAX6675 compartilham SCK e SO (mesmo barramento SPI),
 // cada um com seu próprio pino CS.
 #define MAX1_CS   5
-#define MAX2_CS   22
+#define MAX2_CS   23
 #define MAX_SCK   18
 #define MAX_SO    19
 
