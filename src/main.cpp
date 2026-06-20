@@ -30,8 +30,8 @@
 // Fator de calibração: converte leitura bruta do ADC para Newtons.
 // Obtido experimentalmente com peso conhecido.
 // Cada célula pode ter seu próprio fator (calibre individualmente).
-#define CAL_FACTOR_1  45300
-#define CAL_FACTOR_2  45300
+#define CAL_FACTOR_1  22800
+#define CAL_FACTOR_2  11500
 
 // Pinos GPIO do HX711 #1
 #define HX1_DOUT  21
@@ -90,8 +90,9 @@ MovingAverageFilter filter_2(5);
 #endif
 uint8_t broadcastAddress[] = RECEIVER_MAC;
 
-// Estrutura dos dados enviados via rádio (16 bytes)
+// Estrutura dos dados enviados via rádio (20 bytes)
 typedef struct struct_message {
+    float timestamp_s;       // Timestamp da coleta [s] (millis()/1000)
     float load_cell_1_g;     // Massa filtrada, célula 1 [gramas]
     float load_cell_2_g;     // Massa filtrada, célula 2 [gramas]
     float thermocouple_1_c;  // Temperatura termopar 1 [°C]
@@ -228,6 +229,8 @@ void loop() {
     // 4. ENVIO VIA ESP-NOW (timer 100ms)
     // ========================================================================
     if (now - lastSendMs >= SEND_INTERVAL_MS) {
+        myData.timestamp_s = now / 1000.0f;
+
         esp_err_t result = esp_now_send(
             broadcastAddress,
             (uint8_t *)&myData,
@@ -236,9 +239,10 @@ void loop() {
 
         if (result == ESP_OK) {
             Serial.printf(
-                "LC1:%7.1fg  LC2:%7.1fg  "
+                "%.3fs  LC1:%7.1fg  LC2:%7.1fg  "
                 "TC1:%5.1fC  TC2:%5.1fC  "
                 "Send:%s\n",
+                myData.timestamp_s,
                 myData.load_cell_1_g,
                 myData.load_cell_2_g,
                 myData.thermocouple_1_c,
